@@ -1,37 +1,81 @@
-import os
-import sys
-
-# If we are running from the pyfuse3 source directory, try
-# to load the module from there first.
-basedir = os.path.abspath(os.path.join(os.path.dirname(sys.argv[0]), '..'))
-if (os.path.exists(os.path.join(basedir, 'setup.py')) and
-    os.path.exists(os.path.join(basedir, 'src', 'pyfuse3.pyx'))):
-    sys.path.insert(0, os.path.join(basedir, 'src'))
-
-import pyfuse3
-from argparse import ArgumentParser
-import errno
 import logging
+import os
+import pyfuse3
+import errno
 import stat as stat_m
 from pyfuse3 import FUSEError
-from os import fsencode, fsdecode
+from os import fsencode, fsdecode, makedirs
 from collections import defaultdict
-import trio
 
 import faulthandler
 faulthandler.enable()
 
 log = logging.getLogger(__name__)
 
+
+'''
+IO 错误布局
+一级dir名 -> 操作 -> 返回值
+
+eio 不返回数据，返回 EIO
+half 返回部分数据，返回 EIO
+
+mid 前缀读取 文件 0-128k 成功，之后触发对应错误
+'''
+mount_map = {
+    "normal": {},
+    "eio": {
+        "read": {
+            pyfuse3.FUSEError(errno.EIO): 100
+        },
+        "write": {
+            pyfuse3.FUSEError(errno.EIO): 100
+        }
+    },
+    "mid-eio": {
+        "read": {
+            pyfuse3.FUSEError(errno.EIO): 100
+        },
+        "write": {
+            pyfuse3.FUSEError(errno.EIO): 100
+        }
+    },
+    "half": {
+        "read": {
+            pyfuse3.FUSEError(errno.EIO): 100
+        },
+        "write": {
+            pyfuse3.FUSEError(errno.EIO): 100
+        }
+    },
+    "mid-half": {
+        "read": {
+            pyfuse3.FUSEError(errno.EIO): 100
+        },
+        "write": {
+            pyfuse3.FUSEError(errno.EIO): 100
+        }
+    }
+}
+
 class Operations(pyfuse3.Operations):
 
-    enable_writeback_cache = True
+    enable_writeback_cache = False
 
     def __init__(self, source):
         super().__init__()
-        self._inode_path_map = { pyfuse3.ROOT_INODE: source }
-        self._lookup_cnt = defaultdict(lambda : 0)
+
+        for k in mount_map:
+            makedirs("/dev/shm/mirrors/" + k)
+
+        # tree like
+        # / -> normal -> mirror
+        #   -> eio    -> mirror(with eio)
+        self._inode_path_map = {pyfuse3.ROOT_INODE: source}
+        self._lookup_cnt = defaultdict(lambda: 0)
+        # fd -> inode
         self._fd_inode_map = dict()
+        # inode -> fd
         self._inode_fd_map = dict()
         self._fd_open_count = dict()
 
@@ -59,7 +103,27 @@ class Operations(pyfuse3.Operations):
         if isinstance(val, set):
             val.add(path)
         elif val != path:
-            self._inode_path_map[inode] = { path, val }
+            self._inode_path_map[inode] = {path, val}
+
+    
+    def _get_path(self, inode, name=None):
+        log.debug('_get_path for %d, %s', inode, self._inode_to_path(inode))
+        if os.path.basename(self._inode_to_path(inode)) in mount_map:
+            if name == None :
+                return '/dev/shm/mirrors/normal'
+            else:
+                return os.path.join('/dev/shm/mirrors/normal', name)
+        else:
+            if name == None :
+                return self._inode_to_path(inode)
+            else:
+                return os.path.join(self._inode_to_path(inode), name)
+
+    def _is_total_return():
+        return
+
+    def _return_code():
+        return
 
     async def forget(self, inode_list):
         for (inode, nlookup) in inode_list:
@@ -71,13 +135,12 @@ class Operations(pyfuse3.Operations):
             del self._lookup_cnt[inode]
             try:
                 del self._inode_path_map[inode]
-            except KeyError: # may have been deleted
+            except KeyError:  # may have been deleted
                 pass
 
     async def lookup(self, inode_p, name, ctx=None):
-        name = fsdecode(name)
-        log.debug('lookup for %s in %d', name, inode_p)
-        path = os.path.join(self._inode_to_path(inode_p), name)
+        log.debug('lookup for %s in %d, last is %s', name, inode_p, os.path.basename(self._inode_to_path(inode_p)))
+        path = self._get_path(inode_p, fsdecode(name))
         attr = self._getattr(path=path)
         if name != '.' and name != '..':
             self._add_path(attr.st_ino, path)
@@ -109,7 +172,8 @@ class Operations(pyfuse3.Operations):
         entry.entry_timeout = 0
         entry.attr_timeout = 0
         entry.st_blksize = 512
-        entry.st_blocks = ((entry.st_size+entry.st_blksize-1) // entry.st_blksize)
+        entry.st_blocks = (
+            (entry.st_size+entry.st_blksize-1) // entry.st_blksize)
 
         return entry
 
@@ -125,8 +189,8 @@ class Operations(pyfuse3.Operations):
         return inode
 
     async def readdir(self, inode, off, token):
-        path = self._inode_to_path(inode)
-        log.debug('reading %s', path)
+        path = self._get_path(inode)
+        log.debug('reading %s, last is %s', path, os.path.basename(path))
         entries = []
         for name in os.listdir(path):
             if name == '.' or name == '..':
@@ -146,14 +210,12 @@ class Operations(pyfuse3.Operations):
             if ino <= off:
                 continue
             if not pyfuse3.readdir_reply(
-                token, fsencode(name), attr, ino):
+                    token, fsencode(name), attr, ino):
                 break
             self._add_path(attr.st_ino, os.path.join(path, name))
 
     async def unlink(self, inode_p, name, ctx):
-        name = fsdecode(name)
-        parent = self._inode_to_path(inode_p)
-        path = os.path.join(parent, name)
+        path = self._get_path(inode_p, fsdecode(name))
         try:
             inode = os.lstat(path).st_ino
             os.unlink(path)
@@ -163,9 +225,7 @@ class Operations(pyfuse3.Operations):
             self._forget_path(inode, path)
 
     async def rmdir(self, inode_p, name, ctx):
-        name = fsdecode(name)
-        parent = self._inode_to_path(inode_p)
-        path = os.path.join(parent, name)
+        path = self._get_path(inode_p, fsdecode(name))
         try:
             inode = os.lstat(path).st_ino
             os.rmdir(path)
@@ -185,10 +245,7 @@ class Operations(pyfuse3.Operations):
             del self._inode_path_map[inode]
 
     async def symlink(self, inode_p, name, target, ctx):
-        name = fsdecode(name)
-        target = fsdecode(target)
-        parent = self._inode_to_path(inode_p)
-        path = os.path.join(parent, name)
+        path = self._get_path(inode_p, fsdecode(name))
         try:
             os.symlink(target, path)
             os.chown(path, ctx.uid, ctx.gid, follow_symlinks=False)
@@ -203,12 +260,9 @@ class Operations(pyfuse3.Operations):
         if flags != 0:
             raise FUSEError(errno.EINVAL)
 
-        name_old = fsdecode(name_old)
-        name_new = fsdecode(name_new)
-        parent_old = self._inode_to_path(inode_p_old)
-        parent_new = self._inode_to_path(inode_p_new)
-        path_old = os.path.join(parent_old, name_old)
-        path_new = os.path.join(parent_new, name_new)
+        path_old = self._get_path(inode_p_old, fsdecode(name_old))
+        path_new = self._get_path(inode_p_new, fsdecode(name_new))
+
         try:
             os.rename(path_old, path_new)
             inode = os.lstat(path_new).st_ino
@@ -227,9 +281,7 @@ class Operations(pyfuse3.Operations):
             self._inode_path_map[inode] = path_new
 
     async def link(self, inode, new_inode_p, new_name, ctx):
-        new_name = fsdecode(new_name)
-        parent = self._inode_to_path(new_inode_p)
-        path = os.path.join(parent, new_name)
+        path = self._get_path(new_inode_p, fsdecode(new_name))
         try:
             os.link(self._inode_to_path(inode), path, follow_symlinks=False)
         except OSError as exc:
@@ -299,7 +351,7 @@ class Operations(pyfuse3.Operations):
         return await self.getattr(inode)
 
     async def mknod(self, inode_p, name, mode, rdev, ctx):
-        path = os.path.join(self._inode_to_path(inode_p), fsdecode(name))
+        path = self._get_path(inode_p, fsdecode(name))
         try:
             os.mknod(path, mode=(mode & ~ctx.umask), device=rdev)
             os.chown(path, ctx.uid, ctx.gid)
@@ -310,7 +362,7 @@ class Operations(pyfuse3.Operations):
         return attr
 
     async def mkdir(self, inode_p, name, mode, ctx):
-        path = os.path.join(self._inode_to_path(inode_p), fsdecode(name))
+        path = self._get_path(inode_p, fsdecode(name))
         try:
             os.mkdir(path, mode=(mode & ~ctx.umask))
             os.chown(path, ctx.uid, ctx.gid)
@@ -349,7 +401,7 @@ class Operations(pyfuse3.Operations):
         return pyfuse3.FileInfo(fh=fd)
 
     async def create(self, inode_p, name, mode, flags, ctx):
-        path = os.path.join(self._inode_to_path(inode_p), fsdecode(name))
+        path = self._get_path(inode_p, fsdecode(name))
         try:
             fd = os.open(path, flags | os.O_CREAT | os.O_TRUNC)
         except OSError as exc:
@@ -382,54 +434,3 @@ class Operations(pyfuse3.Operations):
             os.close(fd)
         except OSError as exc:
             raise FUSEError(exc.errno)
-
-def init_logging(debug=False):
-    formatter = logging.Formatter('%(asctime)s.%(msecs)03d %(threadName)s: '
-                                  '[%(name)s] %(message)s', datefmt="%Y-%m-%d %H:%M:%S")
-    handler = logging.StreamHandler()
-    handler.setFormatter(formatter)
-    root_logger = logging.getLogger()
-    if debug:
-        handler.setLevel(logging.DEBUG)
-        root_logger.setLevel(logging.DEBUG)
-    else:
-        handler.setLevel(logging.INFO)
-        root_logger.setLevel(logging.INFO)
-    root_logger.addHandler(handler)
-
-
-def parse_args(args):
-    '''Parse command line'''
-
-    parser = ArgumentParser()
-
-    parser.add_argument('source', type=str,
-                        help='Directory tree to mirror')
-    parser.add_argument('mountpoint', type=str,
-                        help='Where to mount the file system')
-    parser.add_argument('--debug', action='store_true', default=False,
-                        help='Enable debugging output')
-    parser.add_argument('--debug-fuse', action='store_true', default=False,
-                        help='Enable FUSE debugging output')
-
-    return parser.parse_args(args)
-
-def mount():
-    init_logging(True)
-
-    operations = Operations("/root/test")
-    log.debug('Mounting...')
-    fuse_options = set(pyfuse3.default_options)
-    fuse_options.add('fsname=passthroughfs')
-    fuse_options.add('debug')
-    pyfuse3.init(operations, "/root/fs", fuse_options)
-
-    try:
-        log.debug('Entering main loop..')
-        trio.run(pyfuse3.main)
-    except:
-        pyfuse3.close(unmount=True)
-        raise
-
-    log.debug('Unmounting..')
-    pyfuse3.close()
