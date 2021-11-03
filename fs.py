@@ -2,9 +2,10 @@ import logging
 import os
 import pyfuse3
 import errno
+import random
 import stat as stat_m
 from pyfuse3 import FUSEError
-from os import fsencode, fsdecode, makedirs
+from os import fork, fsencode, fsdecode, makedirs
 from collections import defaultdict
 
 import faulthandler
@@ -26,37 +27,49 @@ mount_map = {
     "normal": {},
     "eio": {
         "read": {
-            pyfuse3.FUSEError(errno.EIO): 100
+            errno.EIO: 100
         },
         "write": {
-            pyfuse3.FUSEError(errno.EIO): 100
+            errno.EIO: 100
         }
     },
     "mid-eio": {
         "read": {
-            pyfuse3.FUSEError(errno.EIO): 100
+            errno.EIO: 100
         },
         "write": {
-            pyfuse3.FUSEError(errno.EIO): 100
+            errno.EIO: 100
         }
     },
     "half": {
         "read": {
-            pyfuse3.FUSEError(errno.EIO): 100
+            errno.EIO: 100
         },
         "write": {
-            pyfuse3.FUSEError(errno.EIO): 100
+            errno.EIO: 100
         }
     },
     "mid-half": {
         "read": {
-            pyfuse3.FUSEError(errno.EIO): 100
+            errno.EIO: 100
         },
         "write": {
-            pyfuse3.FUSEError(errno.EIO): 100
+            errno.EIO: 100
         }
     }
 }
+
+result = {}
+
+def _is_total_return(key):
+    return str.find(key, "half", 0, 4) >= 0
+
+def _return_code(key, iotype) -> int:
+    return_types = mount_map[key][iotype]
+    for k in return_types:
+        if random.random() * 100 < return_types[k]:
+            return k
+    return 0
 
 class Operations(pyfuse3.Operations):
 
@@ -118,12 +131,6 @@ class Operations(pyfuse3.Operations):
                 return self._inode_to_path(inode)
             else:
                 return os.path.join(self._inode_to_path(inode), name)
-
-    def _is_total_return():
-        return
-
-    def _return_code():
-        return
 
     async def forget(self, inode_list):
         for (inode, nlookup) in inode_list:
@@ -434,3 +441,9 @@ class Operations(pyfuse3.Operations):
             os.close(fd)
         except OSError as exc:
             raise FUSEError(exc.errno)
+
+
+if __name__ == "__main__":
+    print(pyfuse3.FUSEError(_return_code('eio', 'read')))
+    print(_is_total_return("half-eio"))
+    print(_is_total_return("eio"))
